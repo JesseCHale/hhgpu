@@ -1,0 +1,1001 @@
+#!/usr/bin/env python3
+"""
+hhgpu - HaleHound Apple Silicon system monitor: GPU, per-core CPU, memory, power.
+
+  hhgpu                  live dashboard (ctrl-C to quit)
+  hhgpu -s               one-shot snapshot, prints and exits
+  hhgpu -i 250           sample interval in ms (default 1000)
+  hhgpu -m               hand off to the raw macmon TUI
+  hhgpu -V               version
+  hhgpu -h               this help
+
+  --size 120x40          force a render size (for screenshots / piping)
+  --color MODE           auto (default) | true | 256 | none
+  --demo                 synthetic load, to see the look without running a job
+
+REQUIRES: macmon (brew install macmon) and an Apple Silicon Mac.
+No Python packages. Runs on the stock macOS python3 (tested on 3.9.6).
+
+WHAT IT SHOWS:
+The whole chip on one screen: GPU load, clock and VRAM; every P and E core
+with its own bar; memory pressure and swap; all six power rails (cpu, gpu,
+ane, ram, display, package); fans, temperatures, net and disk.
+
+One file.  No build step, no pip packages, no venv.  It runs macmon and
+draws what macmon reports.
+
+Graphs are braille: 2 samples wide and 4 levels tall per character cell, so a
+60x6 graph holds 120 samples at 24 levels of vertical resolution. Colour runs
+teal at the floor to hot pink at the ceiling -- height and hue say the same
+thing, so a pegged GPU reads as a pink wall at a glance.
+
+COLOUR: 24-bit by default when COLORTERM advertises truecolor, otherwise the
+ramp is quantised to the xterm-256 palette. NO_COLOR (no-color.org) or
+--color none gives a fully working monochrome dashboard. Colour is NOT
+suppressed when stdout is a pipe -- piping into a file is how you screenshot
+this thing, and stripping the ramp would defeat the point. Use --color none.
+
+CREDITS / PROVENANCE: all metrics come from `macmon pipe` by vladkens
+(MIT, https://github.com/vladkens/macmon), invoked as a subprocess -- hhgpu
+contains no macmon code. The braille dot bitmasks and block-element glyphs are
+Unicode Standard definitions; the 256-colour cube levels and grey ramp are
+xterm's published palette. No code is taken from any other monitor.
+
+----
+hhgpu - HaleHound Apple Silicon system monitor
+Copyright (c) 2026 Jesse Hale
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+----
+"HaleHound" is a trademark of Jesse Hale.  The MIT grant above covers THIS
+SOURCE FILE only.  It grants no rights to the HaleHound name, logo or marks,
+and it does not apply to any other HaleHound project: HaleHound firmware is
+proprietary, all rights reserved, and is NOT MIT licensed.
+"""
+
+import atexit
+import json
+import os
+import platform
+import re
+import signal
+import shutil
+import subprocess
+import sys
+import time
+from collections import deque
+
+VERSION = "1.0.0"
+
+MACMON = "/opt/homebrew/bin/macmon"
+if not os.access(MACMON, os.X_OK):
+    MACMON = shutil.which("macmon") or ""
+
+# ---------------------------------------------------------------- palette
+# Synthwave: teal (cold/idle) sweeping to hot pink (hot/pegged).
+# Routed through blue and purple on purpose -- a straight RGB lerp from
+# teal to pink passes through (127,137,173), a muddy blue-grey. The
+# intermediate stops keep every point on the ramp saturated.
+TEAL = (0, 245, 212)
+CYAN = (34, 211, 238)
+BLUE = (99, 102, 241)
+PURPLE = (168, 85, 247)
+MAGENTA = (232, 62, 200)
+HOTPINK = (255, 20, 147)
+
+WHITE = (240, 240, 245)   # values
+DIM = (110, 112, 130)     # labels / units
+RAIL = (52, 48, 68)       # unfilled track and box sides
+
+RAMP = [TEAL, CYAN, BLUE, PURPLE, MAGENTA, HOTPINK]
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+
+EIGHTHS = "▏▎▍▌▋▊▉█"
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+
+# Braille dot bitmasks, [column][row from top].  U+2800 + mask.
+#   dot1 dot4      0x01 0x08
+#   dot2 dot5      0x02 0x10
+#   dot3 dot6      0x04 0x20
+#   dot7 dot8      0x40 0x80
+BRAILLE = ((0x01, 0x02, 0x04, 0x40),
+           (0x08, 0x10, 0x20, 0x80))
+
+GB = 1073741824.0
+
+# Full-scale watts per power rail, for bar scaling only.  These are DISPLAY
+# scales chosen to look sane on an M-series laptop, not spec figures -- if a
+# rail runs past its scale the running peak takes over, so nothing clips.
+RAIL_SCALE = {"cpu": 45.0, "gpu": 55.0, "ane": 10.0,
+              "ram": 10.0, "disp": 6.0, "chip": 110.0}
+
+
+# ---------------------------------------------------------------- colour
+# COLOR is one of "true" (24-bit), "256" (xterm palette), "none" (monochrome).
+# Set once by set_color_mode() before anything draws.
+COLOR = "true"
+_FG_CACHE = {}
+
+# xterm-256 colour cube: 6 levels per channel at 0 then 55+40n for n=1..5,
+# i.e. 0, 95, 135, 175, 215, 255 (0x00 0x5f 0x87 0xaf 0xd7 0xff).
+# Index = 16 + 36*r + 6*g + b.
+CUBE = (0, 95, 135, 175, 215, 255)
+# Greys 232..255 hold 8+10i for i=0..23, i.e. 8 through 238.
+GREY0, GREY_STEP, GREY_N = 8, 10, 24
+
+
+def _cube_idx(v):
+    """Nearest cube level index for one 0-255 channel."""
+    best_i, best_d = 0, 1 << 30
+    for i, lv in enumerate(CUBE):
+        d = v - lv
+        d = -d if d < 0 else d
+        if d < best_d:
+            best_i, best_d = i, d
+    return best_i
+
+
+def xterm256(c):
+    """Nearest xterm-256 index for an RGB triple.
+
+    Tries the 6x6x6 cube AND the 24-step grey ramp and takes whichever is
+    closer by squared RGB distance.  Cube-only quantisation turns the dark
+    desaturated rail colour into a muddy blue; the grey ramp has a much
+    better match for it, and vice versa for the saturated ramp anchors.
+    """
+    r, g, b = c
+    ri, gi, bi = _cube_idx(r), _cube_idx(g), _cube_idx(b)
+    cr, cg, cb = CUBE[ri], CUBE[gi], CUBE[bi]
+    d_cube = (r - cr) ** 2 + (g - cg) ** 2 + (b - cb) ** 2
+    gl = int(round((((r + g + b) / 3.0) - GREY0) / float(GREY_STEP)))
+    gl = 0 if gl < 0 else (GREY_N - 1 if gl > GREY_N - 1 else gl)
+    gv = GREY0 + GREY_STEP * gl
+    d_grey = (r - gv) ** 2 + (g - gv) ** 2 + (b - gv) ** 2
+    return (232 + gl) if d_grey < d_cube else (16 + 36 * ri + 6 * gi + bi)
+
+
+def fg(c):
+    """Foreground escape for an RGB triple, in whatever mode is active.
+
+    Cached: a single gradient rule calls this once per column, and the 256
+    conversion is not free.
+    """
+    s = _FG_CACHE.get(c)
+    if s is None:
+        if COLOR == "true":
+            s = "\033[38;2;%d;%d;%dm" % c
+        elif COLOR == "256":
+            s = "\033[38;5;%dm" % xterm256(c)
+        else:
+            s = ""
+        _FG_CACHE[c] = s
+    return s
+
+
+def set_color_mode(mode):
+    """Select the colour depth and rebuild the escape constants.
+
+    RESET and BOLD have to go empty in monochrome too, or every label still
+    emits an escape and vlen()'s width maths is the only thing keeping the
+    frame intact.
+    """
+    global COLOR, RESET, BOLD
+    COLOR = mode
+    _FG_CACHE.clear()
+    RESET = "" if mode == "none" else "\033[0m"
+    BOLD = "" if mode == "none" else "\033[1m"
+
+
+def detect_color():
+    """Pick a colour mode from the environment.
+
+    NO_COLOR wins outright (no-color.org: honoured when set and non-empty).
+    COLORTERM is the only reliable truecolor signal -- TERM says 256color on
+    plenty of terminals that do 24-bit fine and on some that do not, so
+    absent COLORTERM we quantise rather than guess high.
+    """
+    if os.environ.get("NO_COLOR"):
+        return "none"
+    term = os.environ.get("TERM", "")
+    if term in ("", "dumb"):
+        return "none"
+    ct = os.environ.get("COLORTERM", "").lower()
+    if "truecolor" in ct or "24bit" in ct:
+        return "true"
+    return "256"
+
+
+def vlen(s):
+    """Visible width, ignoring ANSI escapes."""
+    return len(ANSI_RE.sub("", s))
+
+
+def vtrunc(s, w):
+    """Cut to w visible columns, keeping escape sequences intact."""
+    out, n, i = [], 0, 0
+    while i < len(s) and n < w:
+        m = ANSI_RE.match(s, i)
+        if m:
+            out.append(m.group(0))
+            i = m.end()
+            continue
+        out.append(s[i])
+        n += 1
+        i += 1
+    return "".join(out) + (RESET if n >= w else "")
+
+
+def pad(s, w):
+    """Pad OR cut to exactly w visible columns.  The frame cannot break."""
+    n = w - vlen(s)
+    if n > 0:
+        return s + " " * n
+    if n < 0:
+        return vtrunc(s, w)
+    return s
+
+
+def ramp_at(t):
+    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+    seg = t * (len(RAMP) - 1)
+    i = int(seg)
+    if i >= len(RAMP) - 1:
+        return RAMP[-1]
+    a, b, f = RAMP[i], RAMP[i + 1], seg - i
+    return (int(round(a[0] + (b[0] - a[0]) * f)),
+            int(round(a[1] + (b[1] - a[1]) * f)),
+            int(round(a[2] + (b[2] - a[2]) * f)))
+
+
+# ---------------------------------------------------------------- drawing
+def rule(n, c0=0.0, c1=1.0, w_total=None, col0=0):
+    """n box-drawing dashes, coloured along the ramp by absolute column."""
+    if n <= 0:
+        return ""
+    span = (w_total - 1) if w_total else max(1, n - 1)
+    out, last = [], None
+    for i in range(n):
+        t = c0 + (c1 - c0) * ((col0 + i) / span)
+        c = ramp_at(t)
+        if c != last:
+            out.append(fg(c))
+            last = c
+        out.append("─")
+    return "".join(out)
+
+
+def box_top(w, title, right=""):
+    """╭─┤ TITLE ├───────────── right ──╮  with a gradient along the rule."""
+    lab = "┤ " + title + " ├"
+    rt = (" " + right + " ") if right else ""
+    fill = w - 4 - len(lab) - len(rt)
+    if fill < 1:
+        rt = ""
+        fill = max(1, w - 4 - len(lab))
+    col = 0
+    out = [fg(ramp_at(0.0)), "╭", rule(1, w_total=w, col0=1)]
+    col = 2
+    out.append(fg(WHITE) + BOLD + lab + RESET)
+    col += len(lab)
+    out.append(rule(fill, w_total=w, col0=col))
+    col += fill
+    if rt:
+        out.append(fg(DIM) + rt + RESET)
+        col += len(rt)
+    out.append(rule(1, w_total=w, col0=col))
+    out.append(fg(ramp_at(1.0)) + "╮" + RESET)
+    return "".join(out)
+
+
+def box_bot(w):
+    return fg(RAIL) + "╰" + "─" * (w - 2) + "╯" + RESET
+
+
+def boxed(title, body, w, right=""):
+    """Wrap pre-padded body lines (inner width w-4) in a framed panel."""
+    side = fg(RAIL) + "│" + RESET
+    out = [box_top(w, title, right)]
+    for ln in body:
+        out.append(side + " " + pad(ln, w - 4) + " " + side)
+    out.append(box_bot(w))
+    return out
+
+
+def hstack(panels, gap=1):
+    """Lay framed panels side by side.  Panels are lists of equal-width lines."""
+    h = max(len(p) for p in panels)
+    sep = " " * gap
+    rows = []
+    for r in range(h):
+        parts = []
+        for p in panels:
+            parts.append(p[r] if r < len(p) else " " * vlen(p[0]))
+        rows.append(sep.join(parts))
+    return rows
+
+
+def bar(frac, width, solid=None, track=True):
+    """Gradient bar with eighth-block sub-cell precision."""
+    frac = 0.0 if not frac else (1.0 if frac > 1.0 else (0.0 if frac < 0 else frac))
+    total = frac * width
+    full = int(total)
+    rem = total - full
+    out, last = [], None
+    for i in range(full):
+        c = solid or ramp_at(i / max(1, width - 1))
+        if c != last:
+            out.append(fg(c))
+            last = c
+        out.append("█")
+    if rem > 0.08 and full < width:
+        c = solid or ramp_at(full / max(1, width - 1))
+        out.append(fg(c) + EIGHTHS[min(7, int(rem * 8))])
+        full += 1
+    if full < width:
+        out.append(fg(RAIL) + ("─" if track else " ") * (width - full))
+    return "".join(out) + RESET
+
+
+def graph(series, w, h):
+    """Braille history graph: 2w samples, 4h vertical levels, fixed 0-100%.
+
+    Coloured by VERTICAL position, not by sample, so the tops of the peaks
+    burn pink while the floor stays teal.  Every real sample draws at least
+    one dot, so an idle machine shows a flat line instead of an empty box.
+    """
+    levels = 4 * h
+    vals = list(series)[-(2 * w):]
+    off = 2 * w - len(vals)                     # left pad, drawn as nothing
+    grid = [[0] * w for _ in range(h)]
+    for i, v in enumerate(vals):
+        x = (off + i) // 2
+        sub = (off + i) % 2
+        if x >= w:
+            break
+        v = 0.0 if v < 0 else (1.0 if v > 1.0 else v)
+        n = int(round(v * levels))
+        if n < 1:
+            n = 1                                # a real zero is still a sample
+        for d in range(n):
+            row_up = d // 4                      # cell rows from the bottom
+            within = d % 4                       # 0 = bottom dot of that cell
+            y = h - 1 - row_up
+            if y < 0:
+                break
+            grid[y][x] |= BRAILLE[sub][3 - within]
+    lines = []
+    for r in range(h):
+        t = (h - 1 - r + 0.5) / h                # this row's height on the ramp
+        line = fg(ramp_at(t))
+        line += "".join(chr(0x2800 + m) if m else " " for m in grid[r])
+        lines.append(line + RESET)
+    return lines
+
+
+# ---------------------------------------------------------------- format
+def human(n, unit="B"):
+    n = float(n or 0)
+    for suf in ("", "K", "M", "G", "T"):
+        if n < 1024 or suf == "T":
+            return f"{n:.0f}{suf}{unit}" if n >= 100 or suf == "" else f"{n:.1f}{suf}{unit}"
+        n /= 1024.0
+    return f"{n:.1f}T{unit}"
+
+
+def hms(sec):
+    sec = int(sec or 0)
+    d, r = divmod(sec, 86400)
+    h, r = divmod(r, 3600)
+    m = r // 60
+    return f"{d}d {h:02d}:{m:02d}" if d else f"{h:02d}:{m:02d}"
+
+
+def pct_col(v):
+    """Colour a 0-1 value by the ramp, bold once it is effectively pegged."""
+    c = fg(ramp_at(v))
+    return (c + BOLD) if v >= 0.90 else c
+
+
+# ---------------------------------------------------------------- machine
+def sysctl_str(key, default=""):
+    try:
+        out = subprocess.run(["sysctl", "-n", key],
+                             capture_output=True, text=True, timeout=3)
+        return out.stdout.strip() or default
+    except Exception:
+        return default
+
+
+def sysctl_int(key, default=0):
+    try:
+        return int(sysctl_str(key, ""))
+    except (TypeError, ValueError):
+        return default
+
+
+def chip_name():
+    return sysctl_str("machdep.cpu.brand_string", "Apple Silicon")
+
+
+def is_apple_silicon():
+    """hw.optional.arm64 is Rosetta-proof.
+
+    platform.machine() reports x86_64 for a Python running translated on an
+    M-series part, which would wrongly fail the guard on real hardware.  The
+    sysctl is set by the kernel and survives translation; it is absent on
+    Intel, where sysctl_str returns "" and we fall back to the arch check.
+    """
+    if sysctl_str("hw.optional.arm64", "") == "1":
+        return True
+    return platform.machine() == "arm64"
+
+
+def gpu_core_count():
+    try:
+        out = subprocess.run(["system_profiler", "SPDisplaysDataType"],
+                             capture_output=True, text=True, timeout=8).stdout
+        m = re.search(r"Total Number of Cores:\s*(\d+)", out)
+        return int(m.group(1)) if m else 0
+    except Exception:
+        return 0
+
+
+GPU_CORES = None
+
+
+# ---------------------------------------------------------------- state
+class State:
+    def __init__(self, hist=512):
+        self.gpu = deque(maxlen=hist)
+        self.cpu = deque(maxlen=hist)
+        self.gpu_peak = 0.0
+        self.cpu_peak = 0.0
+        self.pwr_peak = 0.0
+        self.rail_peak = {}
+        self.interval = 1000
+        self.chip = chip_name()
+
+    def rail(self, k, v):
+        """Fraction of full scale for a power rail.
+
+        Scaled against a sane full-scale watt figure per rail, NOT against the
+        session peak alone -- peak-only scaling paints every bar near-full on
+        the first frame, because the first sample IS the peak.  If a rail ever
+        exceeds its scale the peak takes over, so nothing ever clips.
+        """
+        p = max(self.rail_peak.get(k, 0.0), v)
+        self.rail_peak[k] = p
+        return v / max(p, RAIL_SCALE.get(k, 10.0))
+
+
+# ---------------------------------------------------------------- panels
+def panel_gpu(d, st, w, gh):
+    inner = w - 4
+    gpu = d.get("gpu_active_ratio") or 0.0
+    freq = d.get("gpu_freq_mhz") or 0
+    pw = d.get("gpu_power") or 0.0
+    inuse = (d.get("gpu_mem_in_use") or 0) / GB
+    wired = (d.get("gpu_mem_alloc") or 0) / GB
+    tg = (d.get("temp") or {}).get("gpu_temp_avg") or 0
+
+    body = graph(st.gpu, inner, gh)
+
+    # Build the readout FIRST, measure it, then give the bar whatever is left.
+    # Sizing the bar from a hardcoded constant overflows the panel the moment
+    # a figure gains a digit (4-digit MHz did exactly that).
+    rhs = (f"  {pct_col(gpu)}{gpu*100:5.1f}%{RESET}"
+           f"  {fg(DIM)}│{RESET} {fg(WHITE)}{freq:>5}{RESET}{fg(DIM)} MHz{RESET}"
+           f"  {fg(DIM)}│{RESET} {fg(WHITE)}{pw:6.2f}{RESET}{fg(DIM)} W{RESET}"
+           f"  {fg(DIM)}│{RESET} {fg(ramp_at((tg-35)/60.0))}{tg:4.0f}°C{RESET}")
+    body.append(bar(gpu, max(10, inner - vlen(rhs))) + rhs)
+    body.append(f"{fg(DIM)}vram{RESET} {fg(WHITE)}{inuse:.2f} GB{RESET}"
+                f"{fg(DIM)} in use · {RESET}{fg(WHITE)}{wired:.2f} GB{RESET}"
+                f"{fg(DIM)} wired · peak {RESET}"
+                f"{fg(ramp_at(st.gpu_peak))}{st.gpu_peak*100:.1f}%{RESET}")
+
+    cores = f"{GPU_CORES}-core" if GPU_CORES else ""
+    return boxed("GPU", body, w, cores)
+
+
+def core_rows(d, inner):
+    """Per-core mini bars: P-cores then E-cores, wrapped to the panel width."""
+    items = []
+    for tag, key in (("P", "pcpu_cores"), ("E", "ecpu_cores")):
+        for i, c in enumerate(d.get(key) or []):
+            items.append((f"{tag}{i}", c.get("active_ratio") or 0.0,
+                          c.get("freq_mhz") or 0))
+    if not items:
+        return []
+    cell = 16                                    # "P0 ▇▇▇▁▁▁▁▁ 100%" + gap
+    per = max(1, inner // cell)
+    mb = cell - 9
+    rows, cur = [], []
+    for name, v, _f in items:
+        cur.append(f"{fg(DIM)}{name:<3}{RESET}{bar(v, mb, track=False)}"
+                   f"{fg(ramp_at(v))}{v*100:4.0f}%{RESET} ")
+        if len(cur) == per:
+            rows.append("".join(cur))
+            cur = []
+    if cur:
+        rows.append("".join(cur))
+    return rows
+
+
+def panel_cpu(d, st, w, gh, with_cores):
+    inner = w - 4
+    cpu = d.get("cpu_active_ratio") or 0.0
+    pr = d.get("pcpu_active_ratio") or 0.0
+    er = d.get("ecpu_active_ratio") or 0.0
+    pf = d.get("pcpu_freq_mhz") or 0
+    ef = d.get("ecpu_freq_mhz") or 0
+    pw = d.get("cpu_power") or 0.0
+    tc = (d.get("temp") or {}).get("cpu_temp_avg") or 0
+    npc = len(d.get("pcpu_cores") or [])
+    nec = len(d.get("ecpu_cores") or [])
+
+    body = graph(st.cpu, inner, gh)
+    rhs = (f"  {pct_col(cpu)}{cpu*100:5.1f}%{RESET}"
+           f"  {fg(DIM)}│{RESET} {fg(DIM)}P{RESET} {fg(ramp_at(pr))}{pr*100:4.1f}%{RESET}"
+           f"{fg(DIM)} @{pf:>4}{RESET}"
+           f"  {fg(DIM)}│{RESET} {fg(DIM)}E{RESET} {fg(ramp_at(er))}{er*100:4.1f}%{RESET}"
+           f"{fg(DIM)} @{ef:>4}{RESET}"
+           f"  {fg(DIM)}│{RESET} {fg(WHITE)}{pw:6.2f}{RESET}{fg(DIM)} W{RESET}"
+           f"  {fg(DIM)}│{RESET} {fg(ramp_at((tc-35)/60.0))}{tc:4.0f}°C{RESET}")
+    body.append(bar(cpu, max(10, inner - vlen(rhs))) + rhs)
+    if with_cores:
+        body.extend(core_rows(d, inner))
+    return boxed("CPU", body, w, f"{npc}P + {nec}E · peak {st.cpu_peak*100:.0f}%")
+
+
+def panel_mem(d, w):
+    inner = w - 4
+    mem = d.get("memory") or {}
+    used = (mem.get("ram_usage") or 0) / GB
+    total = (mem.get("ram_total") or 0) / GB
+    sw = (mem.get("swap_usage") or 0) / GB
+    swt = (mem.get("swap_total") or 0) / GB
+    press = (mem.get("pressure_percent") or 0) / 100.0
+    lvl = mem.get("pressure_level")
+    wired = (d.get("gpu_mem_alloc") or 0) / GB
+    bw = max(8, inner - 22)
+
+    def row(lab, frac, txt, solid=None):
+        return (f"{fg(DIM)}{lab:<6}{RESET}{bar(frac, bw, solid=solid)} "
+                f"{fg(WHITE)}{txt}{RESET}")
+
+    inuse = (d.get("gpu_mem_in_use") or 0) / GB
+    body = [
+        row("RAM", (used / total) if total else 0, f"{used:5.2f}/{total:.0f} GB"),
+        row("FREE", ((total - used) / total) if total else 0,
+            f"{total-used:5.2f} GB free"),
+        row("SWAP", (sw / swt) if swt else 0, f"{sw:5.2f}/{swt:.2f} GB",
+            solid=MAGENTA),
+        row("PRESS", press, f"{press*100:3.0f}%  {fg(DIM)}lvl {lvl}{RESET}"),
+        row("VRAM", (inuse / total) if total else 0, f"{inuse:5.2f} GB in use"),
+        row("WIRED", (wired / total) if total else 0, f"{wired:5.2f} GB to GPU"),
+    ]
+    return boxed("MEMORY", body, w, f"{total:.0f} GB unified")
+
+
+def panel_power(d, st, w):
+    inner = w - 4
+    rails = (("cpu", d.get("cpu_power")), ("gpu", d.get("gpu_power")),
+             ("ane", d.get("ane_power")), ("ram", d.get("ram_power")),
+             ("disp", d.get("display_power")))
+    allp = d.get("all_power") or 0.0
+    st.pwr_peak = max(st.pwr_peak, allp)
+    dcin = d.get("dc_in_power") or 0.0
+    bw = max(8, inner - 20)
+    body = []
+    for name, v in rails:
+        v = v or 0.0
+        body.append(f"{fg(DIM)}{name:<5}{RESET}{bar(st.rail(name, v), bw)} "
+                    f"{fg(WHITE)}{v:6.2f}{RESET}{fg(DIM)} W{RESET}")
+    body.append(f"{fg(DIM)}{'chip':<5}{RESET}"
+                f"{bar(st.rail('chip', allp), bw, solid=HOTPINK)} "
+                f"{fg(WHITE)}{BOLD}{allp:6.2f}{RESET}{fg(DIM)} W{RESET}")
+    return boxed("POWER", body, w, f"peak {st.pwr_peak:.1f} W · in {dcin:.1f} W")
+
+
+def header(d, st, w):
+    npc = len(d.get("pcpu_cores") or [])
+    nec = len(d.get("ecpu_cores") or [])
+    total = (d.get("memory") or {}).get("ram_total", 0) / GB
+    left = f"{fg(HOTPINK)}{BOLD}☠ HALEHOUND{RESET}"
+    # Longest first; drop trailing detail until the line fits the terminal.
+    bits = [f"{total:.0f} GB", f"up {hms(d.get('uptime'))}"]
+    if GPU_CORES:
+        bits.insert(0, f"{GPU_CORES}-core GPU")
+    bits.insert(0, f"{npc}P+{nec}E")
+    while True:
+        tail = (" · " + " · ".join(bits)) if bits else ""
+        right = f"{fg(WHITE)}{st.chip}{RESET}{fg(DIM)}{tail}{RESET}"
+        if vlen(left) + vlen(right) + 3 <= w or not bits:
+            break
+        bits.pop()
+    gapn = w - vlen(left) - vlen(right) - 2
+    if gapn < 1:                                 # even the chip name is too wide
+        return " " + pad(left, w - 1)
+    return " " + left + " " * gapn + right + " "
+
+
+def footer(d, st, w, interval_ms):
+    sec = max(0.05, interval_ms / 1000.0)
+    temp = d.get("temp") or {}
+    tc = temp.get("cpu_temp_avg") or 0
+    tg = temp.get("gpu_temp_avg") or 0
+    fans = d.get("fans") or []
+    batt = d.get("battery_percent")
+    plugged = d.get("battery_plugged")
+    chg = d.get("battery_charging")
+
+    f = []
+    if tc:
+        f.append(f"{fg(ramp_at((tc-35)/60.0))}●{RESET} {fg(DIM)}cpu{RESET} "
+                 f"{fg(WHITE)}{tc:.0f}°C{RESET}")
+    if tg:
+        f.append(f"{fg(ramp_at((tg-35)/60.0))}●{RESET} {fg(DIM)}gpu{RESET} "
+                 f"{fg(WHITE)}{tg:.0f}°C{RESET}")
+    if fans:
+        rpm = max((x.get("rpm") or 0) for x in fans)
+        mx = max((x.get("max_rpm") or 1) for x in fans)
+        f.append(f"{fg(ramp_at(rpm/mx))}●{RESET} {fg(DIM)}fan{RESET} "
+                 f"{fg(WHITE)}{rpm:.0f}{RESET}{fg(DIM)} rpm{RESET}")
+    f.append(f"{fg(TEAL)}↓{RESET}{fg(WHITE)}{human((d.get('net_in') or 0)/sec)}{RESET}"
+             f"{fg(DIM)}/s {RESET}"
+             f"{fg(HOTPINK)}↑{RESET}{fg(WHITE)}{human((d.get('net_out') or 0)/sec)}{RESET}"
+             f"{fg(DIM)}/s{RESET}")
+    f.append(f"{fg(DIM)}disk{RESET} "
+             f"{fg(TEAL)}↓{RESET}{fg(WHITE)}{human((d.get('disk_read') or 0)/sec)}{RESET}"
+             f"{fg(DIM)}/s {RESET}"
+             f"{fg(HOTPINK)}↑{RESET}{fg(WHITE)}{human((d.get('disk_write') or 0)/sec)}{RESET}"
+             f"{fg(DIM)}/s{RESET}")
+    if batt is not None:
+        bc = TEAL if plugged else (HOTPINK if batt < 25 else MAGENTA)
+        tag = "chg" if chg else ("AC" if plugged else "batt")
+        f.append(f"{fg(bc)}●{RESET} {fg(DIM)}{tag}{RESET} {fg(WHITE)}{batt}%{RESET}")
+
+    # Fit to the terminal by DROPPING whole segments, never by wrapping.
+    # Battery is the one worth keeping, so it goes in first when space is tight.
+    sep = f"  {fg(RAIL)}│{RESET}  "
+    while f and vlen(" " + sep.join(f)) > w:
+        f.pop(-2 if len(f) > 1 else -1)
+    return " " + sep.join(f)
+
+
+def tiny(d, st, w):
+    """Single-line readout for a pane too small to frame."""
+    gpu = d.get("gpu_active_ratio") or 0.0
+    cpu = d.get("cpu_active_ratio") or 0.0
+    mem = d.get("memory") or {}
+    used = (mem.get("ram_usage") or 0) / GB
+    total = (mem.get("ram_total") or 0) / GB
+    tg = (d.get("temp") or {}).get("gpu_temp_avg") or 0
+    bw = max(6, (w - 46) // 2)
+    seg = [
+        f"{fg(DIM)}GPU{RESET} {bar(gpu, bw)} {pct_col(gpu)}{gpu*100:5.1f}%{RESET}",
+        f"{fg(DIM)}CPU{RESET} {bar(cpu, bw)} {pct_col(cpu)}{cpu*100:5.1f}%{RESET}",
+        f"{fg(DIM)}RAM{RESET} {fg(WHITE)}{used:.1f}{RESET}{fg(DIM)}/{total:.0f}G{RESET}",
+        f"{fg(ramp_at((tg-35)/60.0))}●{RESET}{fg(WHITE)}{tg:.0f}°C{RESET}",
+        f"{fg(WHITE)}{d.get('gpu_power') or 0.0:.1f}{RESET}{fg(DIM)}W{RESET}",
+    ]
+    while seg and vlen("  ".join(seg)) > w:
+        seg.pop()
+    return ["  ".join(seg)]
+
+
+# ---------------------------------------------------------------- compose
+def compose(d, st, W, H):
+    gpu = d.get("gpu_active_ratio") or 0.0
+    cpu = d.get("cpu_active_ratio") or 0.0
+    st.gpu.append(gpu)
+    st.cpu.append(cpu)
+    st.gpu_peak = max(st.gpu_peak, gpu)
+    st.cpu_peak = max(st.cpu_peak, cpu)
+
+    # No framed layout survives below 60 cols or 9 rows.  Rather than clip the boxes into
+    # garbage, fall back to one dense line -- a narrow split pane still gets
+    # the GPU figure, which is the whole reason this tool exists.
+    if W < 60 or H < 9:
+        return tiny(d, st, W)
+
+    W = max(60, min(W, 220))
+    ncores = len(d.get("pcpu_cores") or []) + len(d.get("ecpu_cores") or [])
+    crows = 0
+    if ncores:
+        per = max(1, (W - 4) // 16)
+        crows = -(-ncores // per)
+
+    # Row budget.  Shed panels in order of expendability, and only then
+    # squeeze the graphs.  Under ~18 rows the graphs go entirely -- live bars
+    # and real numbers are worth more than three rows of braille.
+    #   header+gap 2 | gpu 4+gh | cpu 3+ch+crows | mem/power 8 | footer 1
+    def budget(cores, bottom, graphs):
+        return ((2 if graphs else 1) + 4 + 3
+                + (crows if cores else 0) + (8 if bottom else 0) + 1)
+
+    with_cores = with_bottom = with_graphs = True
+    avail = H - budget(True, True, True)
+    if avail < 6:
+        with_cores = False
+        avail = H - budget(False, True, True)
+    if avail < 6:
+        with_bottom = False
+        avail = H - budget(False, False, True)
+    if avail < 6:
+        with_graphs = False
+        avail = 0
+    gh = ch = 0
+    if with_graphs:
+        avail = max(6, avail)
+        gh = max(3, int(avail * 0.55))
+        ch = max(3, avail - gh)
+
+    out = [header(d, st, W)]
+    if with_graphs:
+        out.append("")
+    out += panel_gpu(d, st, W, gh)
+    out += panel_cpu(d, st, W, ch, with_cores)
+    if with_bottom:
+        lw = (W - 1) // 2
+        rw = W - 1 - lw
+        out += hstack([panel_mem(d, lw), panel_power(d, st, rw)])
+    out.append(footer(d, st, W, st.interval))
+    return out
+
+
+# ---------------------------------------------------------------- input
+def read(samples=1, interval=1000):
+    p = subprocess.Popen([MACMON, "pipe", "-s", str(samples), "-i", str(interval)],
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                         text=True, bufsize=1)
+    try:
+        for line in p.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
+    finally:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+
+
+def demo_stream(n, interval):
+    """Synthetic idle -> pegged -> decay, for checking the render.
+
+    Topology comes from THIS machine so the demo looks right on any part, not
+    just the 10P+4E / 36 GB it was written on:
+      hw.perflevel0.physicalcpu  P (performance) physical cores
+      hw.perflevel1.physicalcpu  E (efficiency)  physical cores
+      hw.memsize                 unified memory, bytes
+    Memory and VRAM figures are fractions of the real total, so they stay
+    plausible on a 16 GB part instead of claiming 16 GB of VRAM on it.
+    Fan ceiling and the swap figures are synthetic -- a fanless Air will show
+    a fan here, which is the one thing --demo invents rather than reads.
+    """
+    import math
+    npc = sysctl_int("hw.perflevel0.physicalcpu", 4) or 4
+    nec = sysctl_int("hw.perflevel1.physicalcpu", 4) or 4
+    ram_b = sysctl_int("hw.memsize", 0) or int(16 * GB)
+    fan_max = 7826
+
+    base = {
+        # 0.436 used is the 15.7/36 GB the original demo hardcoded, kept as a
+        # ratio so it scales with the real part.
+        "memory": {"ram_usage": int(ram_b * 0.436), "ram_total": ram_b,
+                   "swap_usage": int(0.44 * GB), "swap_total": int(2 * GB),
+                   "pressure_percent": 13, "pressure_level": 0},
+        "temp": {"cpu_temp_avg": 39.9, "gpu_temp_avg": 40.0},
+        "fans": [{"rpm": 0, "max_rpm": fan_max}, {"rpm": 0, "max_rpm": fan_max}],
+        "battery_percent": 100, "battery_plugged": True, "battery_charging": False,
+        "uptime": 104645,
+    }
+    i = 0
+    while n == 0 or i < n:
+        t = i / 18.0
+        g = min(1.0, max(0.02, 0.5 + 0.48 * math.sin(t) + 0.04 * math.sin(t * 7)))
+        c = min(1.0, max(0.01, 0.22 + 0.20 * math.sin(t * 1.7 + 1)))
+        d = dict(base)
+        d["gpu_active_ratio"] = g
+        d["gpu_freq_mhz"] = int(400 + 1100 * g)
+        d["gpu_power"] = 0.3 + 26 * g
+        # 1.1 + 15*g GB and 3.5 + 14*g GB on a 36 GB part, as ratios.
+        d["gpu_mem_in_use"] = int(ram_b * (0.031 + 0.417 * g))
+        d["gpu_mem_alloc"] = int(ram_b * (0.097 + 0.389 * g))
+        d["cpu_active_ratio"] = c
+        d["pcpu_active_ratio"] = c * 0.8
+        d["ecpu_active_ratio"] = min(1.0, c * 1.9)
+        d["pcpu_freq_mhz"] = int(1200 + 2600 * c)
+        d["ecpu_freq_mhz"] = int(900 + 1600 * c)
+        d["cpu_power"] = 0.5 + 18 * c
+        d["ane_power"] = 0.0
+        d["ram_power"] = 0.2 + 2.2 * g
+        d["display_power"] = 0.05
+        d["all_power"] = 1.7 + 30 * g + 12 * c
+        d["dc_in_power"] = 11.5 + 30 * g
+        d["net_in"] = int(40000 * (0.3 + g))
+        d["net_out"] = int(900 * (0.3 + c))
+        d["disk_read"] = int(8231 * g)
+        d["disk_write"] = 0
+        d["temp"] = {"cpu_temp_avg": 38 + 30 * c, "gpu_temp_avg": 38 + 52 * g}
+        d["fans"] = [{"rpm": int(fan_max * 0.55 * g), "max_rpm": fan_max},
+                     {"rpm": int(fan_max * 0.52 * g), "max_rpm": fan_max}]
+        d["pcpu_cores"] = [{"active_ratio": max(0.0, min(1.0, c * (0.4 + 1.6 *
+                            abs(math.sin(t * 2 + k))))),
+                            "freq_mhz": int(1000 + 3000 * c)} for k in range(npc)]
+        d["ecpu_cores"] = [{"active_ratio": max(0.0, min(1.0, c * (0.8 + 1.2 *
+                            abs(math.cos(t * 3 + k))))),
+                            "freq_mhz": int(900 + 1600 * c)} for k in range(nec)]
+        yield d
+        i += 1
+        if n == 0:
+            time.sleep(interval / 1000.0)
+
+
+# ---------------------------------------------------------------- modes
+def draw(lines, W, H):
+    sys.stdout.write("\033[H")
+    for ln in lines[:H]:
+        sys.stdout.write("\033[K" + ln + "\n")
+    sys.stdout.write("\033[J")
+    sys.stdout.flush()
+
+
+def restore_term():
+    """Leave the alternate screen and bring the cursor back."""
+    try:
+        sys.stdout.write("\033[?25h\033[?1049l")
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
+def live(interval, demo, force):
+    st = State()
+    st.interval = interval
+    src = demo_stream(0, interval) if demo else read(0, interval)
+
+    # Ctrl-C raises KeyboardInterrupt and unwinds through `finally`, but a
+    # SIGTERM or SIGHUP does NOT -- Python dies on the spot and the terminal
+    # is left in the alternate screen with no cursor.  Catch both.
+    def _bail(sig, _frame):
+        restore_term()
+        os._exit(128 + sig)
+    for s in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(s, _bail)
+        except (ValueError, OSError):
+            pass
+    atexit.register(restore_term)
+
+    sys.stdout.write("\033[?1049h\033[?25l\033[2J")
+    try:
+        for d in src:
+            W, H = force or shutil.get_terminal_size((100, 30))
+            lines = compose(d, st, W, H - 2)
+            draw(lines, W, H - 1)
+            sys.stdout.write(fg(RAIL) + " ctrl-C to quit" + RESET)
+            sys.stdout.flush()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        restore_term()
+    return 0
+
+
+def snapshot(demo, force, interval):
+    st = State()
+    st.interval = interval
+    W, H = force or shutil.get_terminal_size((100, 40))
+    if demo:
+        # Walk the synthetic history so the graphs are full, then print the
+        # last frame.  A one-sample snapshot of a graph is a blank box.
+        frames = list(demo_stream(2 * W + 4, interval))
+        for d in frames[:-1]:
+            compose(d, st, W, max(28, H))
+        print("\n".join(compose(frames[-1], st, W, max(28, H))))
+        return 0
+    for d in read(1):
+        print("\n".join(compose(d, st, W, max(28, H))))
+        return 0
+    sys.stderr.write("hhgpu: no data from macmon\n")
+    return 1
+
+
+def main():
+    global GPU_CORES
+    args = sys.argv[1:]
+    if any(a in ("-h", "--help", "help") for a in args):
+        print(__doc__.strip())
+        return 0
+    if any(a in ("-V", "--version", "version") for a in args):
+        print(f"hhgpu {VERSION}")
+        return 0
+
+    demo = "--demo" in args
+
+    # --color is parsed BEFORE anything can emit an escape.
+    mode = "auto"
+    if "--color" in args:
+        try:
+            mode = args[args.index("--color") + 1].lower()
+        except IndexError:
+            mode = ""
+        if mode not in ("auto", "true", "truecolor", "256", "none", "off", "mono"):
+            sys.stderr.write("hhgpu: --color wants auto, true, 256 or none\n")
+            return 1
+        mode = {"truecolor": "true", "off": "none", "mono": "none"}.get(mode, mode)
+    set_color_mode(detect_color() if mode == "auto" else mode)
+
+    if sys.platform != "darwin":
+        sys.stderr.write("hhgpu: macOS only -- it reads Apple SMC counters.\n")
+        return 1
+    if not is_apple_silicon():
+        sys.stderr.write(
+            "hhgpu: needs an Apple Silicon Mac.  macmon reads arm64-only\n"
+            "       counters (Homebrew marks it `depends_on arch: :arm64`),\n"
+            "       so there is nothing for it to read on an Intel Mac.\n")
+        return 1
+    if not MACMON and not demo:
+        sys.stderr.write("hhgpu: macmon not installed.  brew install macmon\n")
+        return 1
+    if any(a in ("-m", "--macmon") for a in args):
+        if not MACMON:
+            sys.stderr.write("hhgpu: macmon not installed.  brew install macmon\n")
+            return 1
+        os.execv(MACMON, [MACMON])
+
+    interval = 1000
+    if "-i" in args:
+        try:
+            interval = max(200, int(args[args.index("-i") + 1]))
+        except (IndexError, ValueError):
+            sys.stderr.write("hhgpu: -i needs a number in ms\n")
+            return 1
+    force = None
+    if "--size" in args:
+        try:
+            w, h = args[args.index("--size") + 1].lower().split("x")
+            force = (int(w), int(h))
+        except (IndexError, ValueError):
+            sys.stderr.write("hhgpu: --size wants WxH, e.g. 120x40\n")
+            return 1
+    GPU_CORES = gpu_core_count()
+
+    if any(a in ("-s", "--snap", "snap") for a in args):
+        return snapshot(demo, force, interval)
+    return live(interval, demo, force)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.stdout.write("\033[?25h\033[?1049l\n")
+        sys.exit(130)
